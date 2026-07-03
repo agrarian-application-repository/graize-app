@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import logging
-import struct
+import os
 from datetime import datetime, timezone
 
+import numpy as np
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+
+from classify_features import load_model, dequantize
 
 
 # ---------------------------------------------------------------------------
@@ -42,27 +46,50 @@ logger = logging.getLogger("graize-app")
 app = FastAPI()
 
 # ---------------------------------------------------------------------------
+# Classification (feature_1 / feature_2 → animal behaviour prediction)
+# ---------------------------------------------------------------------------
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model_animal_150.pkl")
+
+_model_bundle: dict | None = None
+
+
+def get_model_bundle() -> dict:
+    """Lazily load and cache the trained model + scaler (model_animal_150.pkl)."""
+    global _model_bundle
+    if _model_bundle is None:
+        _model_bundle = load_model(MODEL_PATH)
+    return _model_bundle
+
+
+def classify_feature_group(raw_bytes: bytes):
+    """Dequantize one 6-byte uint8 feature group and classify it."""
+    codes = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(1, -1)
+    bundle = get_model_bundle()
+    feats = dequantize(pd.DataFrame(codes))
+    X = bundle["scaler"].transform(feats.values)
+    pred = bundle["model"].predict(X)[0]
+    return pred.item() if hasattr(pred, "item") else pred
+
+
+# ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-class GnssModel(BaseModel):
-    lat: float = Field(..., ge=-90, le=90)
-    lon: float = Field(..., ge=-180, le=180)
-
-
-class AccelerationModel(BaseModel):
-    x: float
-    y: float
-    z: float
-
-
 class SensorPayload(BaseModel):
-    device_id: str                              # EUI/MAC string from the collar
-    timestamp: datetime
-    temperature: float = Field(..., ge=30.0, le=45.0)
-    gnss: GnssModel
-    acceleration: AccelerationModel
-    battery: int = Field(..., ge=0, le=100)
+    recv_time_utc: datetime
+    dev_eui: str                                 # EUI string from the collar
+    rssi: int | None = None
+    spreading_factor: int | None = None
+    status_flags: int
+    latitude: int                                # already scaled per Location_history schema
+    longitude: int                               # already scaled per Location_history schema
+    altitude: int | None = None
+    temperature: int | None = None
+    feature_1: str                               # hex-encoded bytes
+    feature_2: str                               # hex-encoded bytes
+    crc: int | None = None
+    crc_ok: bool | None = None                    # informational only, not persisted
 
 
 # ---------------------------------------------------------------------------
@@ -104,59 +131,49 @@ def get_or_create_device(cursor, eui: str) -> int:
     return device_id
 
 
-def pack_acceleration(acc: AccelerationModel) -> bytes:
-    """
-    Pack x, y, z floats into a compact binary blob (3 × 4 bytes = 12 bytes).
-    Uses little-endian IEEE 754 single-precision floats, matching typical
-    accelerometer output formats.
-    """
-    return struct.pack("<fff", acc.x, acc.y, acc.z)
-
-
 def insert_location(cursor, device_id: int, payload: SensorPayload):
     """Insert one row into Location_history."""
-    # Convert float degrees to Int32 (× 10^7) as per schema
-    lat_int = int(round(payload.gnss.lat * 1e7))
-    lon_int = int(round(payload.gnss.lon * 1e7))
-    temp_int = int(round(payload.temperature * 10))   # store as tenths of degree
-
     cursor.execute(
         """
         INSERT INTO Location_history
             (Device_id, Latitude, Longitude, Altitude, Temperature, Time)
         VALUES
-            (%s, %s, %s, NULL, %s, %s)
+            (%s, %s, %s, %s, %s, %s)
         """,
-        (device_id, lat_int, lon_int, temp_int, payload.timestamp)
+        (device_id, payload.latitude, payload.longitude, payload.altitude,
+         payload.temperature, payload.recv_time_utc)
     )
 
 
 def insert_feature(cursor, device_id: int, payload: SensorPayload):
-    """Insert one row into Feature_history (raw acceleration blob)."""
-    blob = pack_acceleration(payload.acceleration)
-    unix_ts = int(payload.timestamp.timestamp())        # Int64 Unix timestamp
+    """Insert one row into Feature_history from the gateway's hex-encoded blobs."""
+    feature_1 = bytes.fromhex(payload.feature_1)
+    feature_2 = bytes.fromhex(payload.feature_2)
+    unix_ts = int(payload.recv_time_utc.timestamp())    # Int64 Unix timestamp
 
     cursor.execute(
         """
         INSERT INTO Feature_history
-            (Device_id, Blob_features, Time_unix, Time)
+            (Device_id, Feature_1, Feature_2, Time_unix, Time)
         VALUES
-            (%s, %s, %s, %s)
+            (%s, %s, %s, %s, %s)
         """,
-        (device_id, psycopg2.Binary(blob), unix_ts, payload.timestamp)
+        (device_id, psycopg2.Binary(feature_1), psycopg2.Binary(feature_2),
+         unix_ts, payload.recv_time_utc)
     )
 
 
 def insert_status(cursor, device_id: int, payload: SensorPayload):
-    """Insert one row into Status_history (battery level as status flag)."""
+    """Insert one row into Status_history."""
     cursor.execute(
         """
         INSERT INTO Status_history
             (Device_id, Status_flag, RSSI, SF, Time)
         VALUES
-            (%s, %s, NULL, NULL, %s)
+            (%s, %s, %s, %s, %s)
         """,
-        (device_id, payload.battery, payload.timestamp)
+        (device_id, payload.status_flags, payload.rssi, payload.spreading_factor,
+         payload.recv_time_utc)
     )
 
 
@@ -179,6 +196,20 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/health/db")
+async def health_db():
+    try:
+        conn = get_connection()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        conn.close()
+        return {"status": "healthy", "db_host": settings.db_host, "db_name": settings.db_name}
+    except psycopg2.Error as e:
+        logger.error("DB connection check failed: %s", e)
+        raise HTTPException(status_code=503, detail="Database connection failed")
+
+
 @app.post("/ingest-test", status_code=200)
 async def ingest_test(request: Request):
     body = await request.json()
@@ -190,25 +221,34 @@ async def ingest_test(request: Request):
 async def ingest(payload: SensorPayload, request: Request):
     client = request.client.host if request.client else "unknown"
     logger.info(
-        "INGEST | from=%s device=%s ts=%s temp=%.1f bat=%d%% gnss=(%.4f,%.4f) acc=(%.2f,%.2f,%.2f)",
+        "INGEST | from=%s dev_eui=%s ts=%s rssi=%s sf=%s status=%s temp=%s gnss=(%s,%s) alt=%s",
         client,
-        payload.device_id,
-        payload.timestamp.isoformat(),
+        payload.dev_eui,
+        payload.recv_time_utc.isoformat(),
+        payload.rssi,
+        payload.spreading_factor,
+        payload.status_flags,
         payload.temperature,
-        payload.battery,
-        payload.gnss.lat,
-        payload.gnss.lon,
-        payload.acceleration.x,
-        payload.acceleration.y,
-        payload.acceleration.z,
+        payload.latitude,
+        payload.longitude,
+        payload.altitude,
     )
+
+    try:
+        prediction_1 = classify_feature_group(bytes.fromhex(payload.feature_1))
+        prediction_2 = classify_feature_group(bytes.fromhex(payload.feature_2))
+        logger.info("CLASSIFY | dev_eui=%s pred_1=%s pred_2=%s",
+                    payload.dev_eui, prediction_1, prediction_2)
+    except Exception as e:
+        logger.error("Classification failed for dev_eui=%s: %s", payload.dev_eui, e)
+        prediction_1 = prediction_2 = None
 
     try:
         conn = get_connection()
         with conn:                          # auto-commit on success, rollback on error
             with conn.cursor() as cur:
                 # 1. Resolve device EUI → integer Device_id
-                device_id = get_or_create_device(cur, payload.device_id)
+                device_id = get_or_create_device(cur, payload.dev_eui)
 
                 # 2. Insert into the three raw history tables
                 insert_location(cur, device_id, payload)
@@ -216,7 +256,7 @@ async def ingest(payload: SensorPayload, request: Request):
                 insert_status(cur, device_id, payload)
 
         conn.close()
-        logger.info("DB inserts OK for device=%s", payload.device_id)
+        logger.info("DB inserts OK for dev_eui=%s", payload.dev_eui)
 
     except psycopg2.Error as e:
         logger.error("DB error: %s", e)
@@ -224,8 +264,12 @@ async def ingest(payload: SensorPayload, request: Request):
 
     return {
         "status": "accepted",
-        "device_id": payload.device_id,
+        "dev_eui": payload.dev_eui,
         "received_at": datetime.now(timezone.utc).isoformat(),
+        "classification": {
+            "feature_1": prediction_1,
+            "feature_2": prediction_2,
+        },
     }
 
 

@@ -3,3 +3,7 @@ uvicorn==0.23.2
 pydantic>=2.0,<3.0
 psycopg2-binary
 pydantic-settings
+joblib
+pandas
+numpy
+scikit-learn

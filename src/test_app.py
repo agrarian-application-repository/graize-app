@@ -6,12 +6,19 @@ from app import app
 client = TestClient(app)
 
 VALID_PAYLOAD = {
-    "device_id": "cow_01",
-    "timestamp": "2026-06-23T09:15:00Z",
-    "temperature": 38.6,
-    "gnss": {"lat": 44.52, "lon": 8.91},
-    "acceleration": {"x": 0.12, "y": 0.42, "z": 0.08},
-    "battery": 84,
+    "recv_time_utc": "2026-07-02T15:11:29.624862+00:00",
+    "dev_eui": "a8610a3432398609",
+    "rssi": -93,
+    "spreading_factor": 9,
+    "status_flags": 1,
+    "latitude": 443980648,
+    "longitude": 89513693,
+    "altitude": 63,
+    "temperature": 29,
+    "feature_1": "0181017a11ff",
+    "feature_2": "017a017c0fff",
+    "crc": 39345,
+    "crc_ok": True,
 }
 
 
@@ -42,28 +49,34 @@ def test_ingest_valid():
     assert r.status_code == 202
     body = r.json()
     assert body["status"] == "accepted"
-    assert body["device_id"] == "cow_01"
+    assert body["dev_eui"] == "a8610a3432398609"
     assert "received_at" in body
 
 
 def test_ingest_missing_field():
-    r = client.post("/ingest", json={"device_id": "cow_01"})
+    r = client.post("/ingest", json={"dev_eui": "a8610a3432398609"})
     assert r.status_code == 422
 
 
-def test_ingest_temperature_out_of_range():
-    payload = {**VALID_PAYLOAD, "temperature": 50.0}
+def test_ingest_missing_feature_blob():
+    payload = {k: v for k, v in VALID_PAYLOAD.items() if k != "feature_2"}
     r = client.post("/ingest", json=payload)
     assert r.status_code == 422
 
 
-def test_ingest_battery_out_of_range():
-    payload = {**VALID_PAYLOAD, "battery": 110}
-    r = client.post("/ingest", json=payload)
-    assert r.status_code == 422
+def test_ingest_optional_fields_absent():
+    payload = {k: v for k, v in VALID_PAYLOAD.items()
+               if k not in ("rssi", "spreading_factor", "altitude", "temperature", "crc", "crc_ok")}
 
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (1,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.__enter__ = lambda s: s
+    mock_conn.__exit__ = MagicMock(return_value=False)
 
-def test_ingest_invalid_gnss():
-    payload = {**VALID_PAYLOAD, "gnss": {"lat": 200.0, "lon": 8.91}}
-    r = client.post("/ingest", json=payload)
-    assert r.status_code == 422
+    with patch("app.get_connection", return_value=mock_conn):
+        r = client.post("/ingest", json=payload)
+
+    assert r.status_code == 202

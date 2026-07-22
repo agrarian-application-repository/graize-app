@@ -321,6 +321,8 @@ async def ingest(payload: SensorPayload, request: Request):
                 fixes = prior_fixes + [(payload.latitude, payload.longitude, payload.recv_time_utc)]
                 lats = [lat / LAT_LON_SCALE for lat, lon, _ in fixes]
                 lons = [lon / LAT_LON_SCALE for lat, lon, _ in fixes]
+                logger.info("MOVEMENT | dev_eui=%s n_fixes=%d lats=%s lons=%s",
+                            payload.dev_eui, len(fixes), lats, lons)
 
                 try:
                     movement_features = extract_features(lats, lons)

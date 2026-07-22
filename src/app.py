@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
 from classify_features import load_model, dequantize
+from classify_movement import extract_features, classify, LAT_LON_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,61 @@ def get_or_create_device(cursor, eui: str) -> int:
     return device_id
 
 
+def get_recent_locations(cursor, device_id: int, limit: int = 11):
+    """Fetch the `limit` most recent (lat, lon, time) fixes for a device, oldest first."""
+    cursor.execute(
+        """
+        SELECT Latitude, Longitude, Time
+        FROM Location_history
+        WHERE Device_id = %s
+        ORDER BY Time DESC
+        LIMIT %s
+        """,
+        (device_id, limit)
+    )
+    rows = cursor.fetchall()
+    rows.reverse()
+    return rows
+
+
+def get_or_create_movement_activity(cursor, name: str) -> int:
+    """
+    Look up a movement activity by name. If it doesn't exist yet, insert it.
+    Returns the integer Movement_activity_id.
+    """
+    cursor.execute(
+        "SELECT Movement_activity_id FROM Movement_activities_set WHERE Name = %s",
+        (name,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+
+    # Label not seen before — register it automatically
+    cursor.execute(
+        "INSERT INTO Movement_activities_set (Name) VALUES (%s) RETURNING Movement_activity_id",
+        (name,)
+    )
+    movement_activity_id = cursor.fetchone()[0]
+    logger.info("Registered new movement activity name=%s → Movement_activity_id=%d",
+                name, movement_activity_id)
+    return movement_activity_id
+
+
+def insert_location_activity(cursor, device_id: int, movement_activity_id: int,
+                              time_start, time_end):
+    """Insert one row into Location_activities."""
+    cursor.execute(
+        """
+        INSERT INTO Location_activities
+            (Device_id, Movement_activity_id, Time_start, Time_end)
+        VALUES
+            (%s, %s, %s, %s)
+        """,
+        (device_id, movement_activity_id, time_start, time_end)
+    )
+
+
 def insert_location(cursor, device_id: int, payload: SensorPayload):
     """Insert one row into Location_history."""
     cursor.execute(
@@ -243,6 +299,9 @@ async def ingest(payload: SensorPayload, request: Request):
         logger.error("Classification failed for dev_eui=%s: %s", payload.dev_eui, e)
         prediction_1 = prediction_2 = None
 
+    movement_features = None
+    movement_label = None
+
     try:
         conn = get_connection()
         with conn:                          # auto-commit on success, rollback on error
@@ -250,10 +309,29 @@ async def ingest(payload: SensorPayload, request: Request):
                 # 1. Resolve device EUI → integer Device_id
                 device_id = get_or_create_device(cur, payload.dev_eui)
 
-                # 2. Insert into the three raw history tables
+                # 2. Fetch the last 11 fixes (this one makes 12) for movement classification
+                prior_fixes = get_recent_locations(cur, device_id, limit=11)
+
+                # 3. Insert into the three raw history tables
                 insert_location(cur, device_id, payload)
                 insert_feature(cur, device_id, payload)
                 insert_status(cur, device_id, payload)
+
+                # 4. Classify movement over the sliding window and log the activity interval
+                fixes = prior_fixes + [(payload.latitude, payload.longitude, payload.recv_time_utc)]
+                lats = [lat / LAT_LON_SCALE for lat, lon, _ in fixes]
+                lons = [lon / LAT_LON_SCALE for lat, lon, _ in fixes]
+
+                try:
+                    movement_features = extract_features(lats, lons)
+                    movement_label = classify(movement_features)
+                    movement_activity_id = get_or_create_movement_activity(cur, movement_label)
+                    insert_location_activity(cur, device_id, movement_activity_id,
+                                              time_start=fixes[0][2], time_end=fixes[-1][2])
+                    logger.info("MOVEMENT | dev_eui=%s features=%s label=%s",
+                                payload.dev_eui, movement_features, movement_label)
+                except ValueError as e:
+                    logger.info("MOVEMENT | dev_eui=%s skipped: %s", payload.dev_eui, e)
 
         conn.close()
         logger.info("DB inserts OK for dev_eui=%s", payload.dev_eui)
@@ -269,6 +347,10 @@ async def ingest(payload: SensorPayload, request: Request):
         "classification": {
             "feature_1": prediction_1,
             "feature_2": prediction_2,
+        },
+        "movement": {
+            "label": movement_label,
+            "features": movement_features,
         },
     }
 

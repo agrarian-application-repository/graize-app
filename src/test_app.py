@@ -36,7 +36,9 @@ def test_health():
 
 def test_ingest_valid():
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (1,)  # simulate device already in DB
+    # fetchone() is called twice: get_or_create_device (device already in DB),
+    # then get_last_feature_reading (no previous reading for this device).
+    mock_cursor.fetchone.side_effect = [(1,), None]
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
@@ -69,7 +71,9 @@ def test_ingest_optional_fields_absent():
                if k not in ("rssi", "spreading_factor", "altitude", "temperature", "crc", "crc_ok")}
 
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (1,)
+    # fetchone() is called twice: get_or_create_device (device already in DB),
+    # then get_last_feature_reading (no previous reading for this device).
+    mock_cursor.fetchone.side_effect = [(1,), None]
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)

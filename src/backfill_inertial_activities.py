@@ -104,10 +104,13 @@ def build_slots(readings):
 
 
 def main():
-    conn = psycopg2.connect(
-        host=settings.db_host, port=settings.db_port, dbname=settings.db_name,
-        user=settings.db_user, password=settings.db_password,
-    )
+    conn = psycopg2.connect(**{
+        "host": settings.db_host,
+        "port": settings.db_port,
+        "dbname": settings.db_name,
+        "user": settings.db_user,
+        "password": settings.db_password,
+    })
     bundle = load_model(MODEL_PATH)
 
     total_readings = 0

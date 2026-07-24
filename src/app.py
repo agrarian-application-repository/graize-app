@@ -187,6 +187,59 @@ def insert_location_activity(cursor, device_id: int, movement_activity_id: int,
     )
 
 
+def get_last_feature_reading(cursor, device_id: int):
+    """Fetch the most recent (time, feature_1, feature_2) reading for a device, if any."""
+    cursor.execute(
+        """
+        SELECT Time, Feature_1, Feature_2
+        FROM Feature_history
+        WHERE Device_id = %s
+        ORDER BY Time DESC
+        LIMIT 1
+        """,
+        (device_id,)
+    )
+    return cursor.fetchone()
+
+
+def get_or_create_inertial_activity(cursor, name: str) -> int:
+    """
+    Look up an inertial activity by name. If it doesn't exist yet, insert it.
+    Returns the integer Inertial_activity_id.
+    """
+    cursor.execute(
+        "SELECT Inertial_activity_id FROM Inertial_activities_set WHERE Name = %s",
+        (name,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+
+    # Label not seen before — register it automatically
+    cursor.execute(
+        "INSERT INTO Inertial_activities_set (Name) VALUES (%s) RETURNING Inertial_activity_id",
+        (name,)
+    )
+    inertial_activity_id = cursor.fetchone()[0]
+    logger.info("Registered new inertial activity name=%s → Inertial_activity_id=%d",
+                name, inertial_activity_id)
+    return inertial_activity_id
+
+
+def insert_inertial_activity(cursor, device_id: int, inertial_activity_id: int,
+                              time_start, time_end):
+    """Insert one row into Inertial_activities."""
+    cursor.execute(
+        """
+        INSERT INTO Inertial_activities
+            (Device_id, Inertial_activity_id, Time_start, Time_end)
+        VALUES
+            (%s, %s, %s, %s)
+        """,
+        (device_id, inertial_activity_id, time_start, time_end)
+    )
+
+
 def insert_location(cursor, device_id: int, payload: SensorPayload):
     """Insert one row into Location_history."""
     cursor.execute(
@@ -312,6 +365,9 @@ async def ingest(payload: SensorPayload, request: Request):
                 # 2. Fetch the last 11 fixes (this one makes 12) for movement classification
                 prior_fixes = get_recent_locations(cur, device_id, limit=11)
 
+                # 2b. Fetch the previous reading to finalize its inertial activity slices
+                last_feature_reading = get_last_feature_reading(cur, device_id)
+
                 # 3. Insert into the three raw history tables
                 insert_location(cur, device_id, payload)
                 insert_feature(cur, device_id, payload)
@@ -334,6 +390,26 @@ async def ingest(payload: SensorPayload, request: Request):
                                 payload.dev_eui, movement_features, movement_label)
                 except ValueError as e:
                     logger.info("MOVEMENT | dev_eui=%s skipped: %s", payload.dev_eui, e)
+
+                # 5. Finalize the previous reading's inertial activity slices now that
+                #    this reading's timestamp bounds its second half. (One-reading lag:
+                #    a reading's own slices are written on the *next* ingest call.)
+                if last_feature_reading is not None:
+                    prev_time, prev_feature_1, prev_feature_2 = last_feature_reading
+                    prev_pred_1 = classify_feature_group(bytes(prev_feature_1))
+                    prev_pred_2 = classify_feature_group(bytes(prev_feature_2))
+                    mid = prev_time + (payload.recv_time_utc - prev_time) / 2
+
+                    for label, start, end in ((prev_pred_1, prev_time, mid),
+                                               (prev_pred_2, mid, payload.recv_time_utc)):
+                        if start < end:
+                            inertial_activity_id = get_or_create_inertial_activity(cur, label)
+                            insert_inertial_activity(cur, device_id, inertial_activity_id, start, end)
+
+                    logger.info("INERTIAL | dev_eui=%s prev_time=%s pred_1=%s pred_2=%s",
+                                payload.dev_eui, prev_time.isoformat(), prev_pred_1, prev_pred_2)
+                else:
+                    logger.info("INERTIAL | dev_eui=%s skipped: no previous reading", payload.dev_eui)
 
         conn.close()
         logger.info("DB inserts OK for dev_eui=%s", payload.dev_eui)

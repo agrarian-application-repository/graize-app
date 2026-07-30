@@ -78,7 +78,7 @@ Run from the repo root: `app.py`'s local imports (`classify_features`, `classify
   "dev_eui": "a8610a3432398609",
   "received_at": "2026-07-24T09:15:00.123456+00:00",
   "classification": { "feature_1": "foraging", "feature_2": "foraging" },
-  "movement": { "label": "grazing", "features": { "path_length_m": 42.1, "max_displacement_from_start_m": 18.3, "motion_fraction": 0.27, "n_fixes": 12 } }
+  "movement": { "label": "grazing", "features": { "path_length_m": 42.1, "max_displacement_from_start_m": 18.3, "diameter_m": 35.6, "motion_fraction": 0.27, "n_fixes": 12 } }
 }
 ```
 

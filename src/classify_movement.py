@@ -14,7 +14,12 @@ Reads N (lat, lon) fixes sampled at a fixed low frequency (default: every
 Features computed:
     path_length              — total distance covered (sum of haversine steps)
     max_displacement_from_start — furthest point reached from the first fix
+    diameter                 — max distance between any two fixes in the window
     motion_fraction          — fraction of steps exceeding STEP_THRESHOLD_M
+
+Static is judged on `diameter` rather than `path_length`: an animal shuffling
+back and forth within a small area racks up path length without ever leaving
+that area, so diameter is the truer measure of "did it actually go anywhere."
 
 Usage:
     python classify_movement.py fixes.csv
@@ -39,8 +44,9 @@ LAT_LON_SCALE = 1e7
 # Minimum step distance (metres) to count as actual movement vs. GPS jitter.
 STEP_THRESHOLD_M = 30.0
 
-# Total path length (metres) below which the animal is classified as static.
-STATIC_PATH_THRESHOLD_M = 100.0
+# Diameter (metres, max distance between any two fixes in the window) below
+# which the animal is classified as static.
+STATIC_DIAMETER_THRESHOLD_M = 50.0
 
 # Max displacement from the starting fix (metres) above which the animal is
 # classified as displaced.
@@ -69,6 +75,10 @@ def extract_features(lats: list, lons: list) -> dict:
 
     steps = [haversine(lats[i], lons[i], lats[i + 1], lons[i + 1]) for i in range(n - 1)]
     displacements_from_start = [haversine(lats[0], lons[0], lats[i], lons[i]) for i in range(1, n)]
+    diameter = max(
+        haversine(lats[i], lons[i], lats[j], lons[j])
+        for i in range(n) for j in range(i + 1, n)
+    )
 
     path_length = sum(steps)
     max_displacement = max(displacements_from_start)
@@ -77,6 +87,7 @@ def extract_features(lats: list, lons: list) -> dict:
     return {
         "path_length_m":              round(path_length, 1),
         "max_displacement_from_start_m": round(max_displacement, 1),
+        "diameter_m":                 round(diameter, 1),
         "motion_fraction":            round(motion_fraction, 3),
         "n_fixes":                    n,
     }
@@ -85,9 +96,9 @@ def extract_features(lats: list, lons: list) -> dict:
 # ── Classification ───────────────────────────────────────────────────────────
 
 def classify(features: dict,
-             static_threshold: float = STATIC_PATH_THRESHOLD_M,
+             static_threshold: float = STATIC_DIAMETER_THRESHOLD_M,
              displaced_threshold: float = DISPLACED_MAX_DISP_THRESHOLD_M) -> str:
-    if features["path_length_m"] < static_threshold:
+    if features["diameter_m"] < static_threshold:
         return "static"
     if features["max_displacement_from_start_m"] > displaced_threshold:
         return "displaced"
@@ -105,8 +116,8 @@ def main():
                         help="Name of the latitude column (default: lat).")
     parser.add_argument("--lon-col", default="lon",
                         help="Name of the longitude column (default: lon).")
-    parser.add_argument("--static-threshold", type=float, default=STATIC_PATH_THRESHOLD_M,
-                        help=f"Path length (m) below which → static (default: {STATIC_PATH_THRESHOLD_M}).")
+    parser.add_argument("--static-threshold", type=float, default=STATIC_DIAMETER_THRESHOLD_M,
+                        help=f"Diameter (m) below which → static (default: {STATIC_DIAMETER_THRESHOLD_M}).")
     parser.add_argument("--displaced-threshold", type=float, default=DISPLACED_MAX_DISP_THRESHOLD_M,
                         help=f"Max displacement (m) above which → displaced (default: {DISPLACED_MAX_DISP_THRESHOLD_M}).")
     args = parser.parse_args()
@@ -133,10 +144,11 @@ def main():
     print(f"\nResult:  {label.upper()}\n")
     print(f"  Fixes:                       {features['n_fixes']}")
     print(f"  Path length:                 {features['path_length_m']:.1f} m")
+    print(f"  Diameter:                    {features['diameter_m']:.1f} m")
     print(f"  Max displacement from start: {features['max_displacement_from_start_m']:.1f} m")
     print(f"  Motion fraction:             {features['motion_fraction']:.1%}")
     print(f"\nThresholds used:")
-    print(f"  static    if path_length < {args.static_threshold:.0f} m")
+    print(f"  static    if diameter < {args.static_threshold:.0f} m")
     print(f"  displaced if max_displacement > {args.displaced_threshold:.0f} m")
     print(f"  grazing   otherwise\n")
 

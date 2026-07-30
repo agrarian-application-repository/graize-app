@@ -132,17 +132,33 @@ def get_or_create_device(cursor, eui: str) -> int:
     return device_id
 
 
-def get_recent_locations(cursor, device_id: int, limit: int = 11):
-    """Fetch the `limit` most recent (lat, lon, time) fixes for a device, oldest first."""
+LAT_SCALED_BOUND = int(90 * LAT_LON_SCALE)
+LON_SCALED_BOUND = int(180 * LAT_LON_SCALE)
+
+
+def is_valid_coordinate(latitude: int, longitude: int) -> bool:
+    """True if the scaled lat/lon fall within plausible GPS bounds (not e.g. the
+    INT32_MAX no-fix sentinel, which decodes to lat=lon=214.7483647)."""
+    return -LAT_SCALED_BOUND < latitude < LAT_SCALED_BOUND and \
+        -LON_SCALED_BOUND < longitude < LON_SCALED_BOUND
+
+
+def get_recent_valid_locations(cursor, device_id: int, limit: int = 11):
+    """Fetch the `limit` most recent (lat, lon, time) fixes for a device that have a
+    plausible (in-range) coordinate, oldest first. Invalid fixes are skipped rather
+    than counted, so this always digs as far back as needed to find `limit` of them."""
     cursor.execute(
         """
         SELECT Latitude, Longitude, Time
         FROM Location_history
         WHERE Device_id = %s
+          AND Latitude > %s AND Latitude < %s
+          AND Longitude > %s AND Longitude < %s
         ORDER BY Time DESC
         LIMIT %s
         """,
-        (device_id, limit)
+        (device_id, -LAT_SCALED_BOUND, LAT_SCALED_BOUND,
+         -LON_SCALED_BOUND, LON_SCALED_BOUND, limit)
     )
     rows = cursor.fetchall()
     rows.reverse()
@@ -362,8 +378,20 @@ async def ingest(payload: SensorPayload, request: Request):
                 # 1. Resolve device EUI → integer Device_id
                 device_id = get_or_create_device(cur, payload.dev_eui)
 
-                # 2. Fetch the last 11 fixes (this one makes 12) for movement classification
-                prior_fixes = get_recent_locations(cur, device_id, limit=11)
+                # 2. Build the movement window out of the last 12 *valid* fixes.
+                #    Normal case: 11 valid prior fixes from history + this one (if valid).
+                #    If this reading's own fix is invalid, it can't anchor/extend the
+                #    window, so fall back to the last 12 valid fixes from history instead.
+                current_valid = is_valid_coordinate(payload.latitude, payload.longitude)
+                if current_valid:
+                    prior_fixes = get_recent_valid_locations(cur, device_id, limit=11)
+                    fixes = prior_fixes + [(payload.latitude, payload.longitude, payload.recv_time_utc)]
+                else:
+                    fixes = get_recent_valid_locations(cur, device_id, limit=12)
+                    logger.warning(
+                        "MOVEMENT | dev_eui=%s current fix invalid (lat=%s lon=%s); excluded from window",
+                        payload.dev_eui, payload.latitude, payload.longitude,
+                    )
 
                 # 2b. Fetch the previous reading to finalize its inertial activity slices
                 last_feature_reading = get_last_feature_reading(cur, device_id)
@@ -374,13 +402,17 @@ async def ingest(payload: SensorPayload, request: Request):
                 insert_status(cur, device_id, payload)
 
                 # 4. Classify movement over the sliding window and log the activity interval
-                fixes = prior_fixes + [(payload.latitude, payload.longitude, payload.recv_time_utc)]
-                lats = [lat / LAT_LON_SCALE for lat, lon, _ in fixes]
-                lons = [lon / LAT_LON_SCALE for lat, lon, _ in fixes]
-                logger.info("MOVEMENT | dev_eui=%s n_fixes=%d lats=%s lons=%s",
-                            payload.dev_eui, len(fixes), lats, lons)
+                if len(fixes) < 12:
+                    logger.info(
+                        "MOVEMENT | dev_eui=%s skipped: only %d valid fixes available (need 12)",
+                        payload.dev_eui, len(fixes),
+                    )
+                else:
+                    lats = [lat / LAT_LON_SCALE for lat, lon, _ in fixes]
+                    lons = [lon / LAT_LON_SCALE for lat, lon, _ in fixes]
+                    logger.info("MOVEMENT | dev_eui=%s n_fixes=%d lats=%s lons=%s",
+                                payload.dev_eui, len(fixes), lats, lons)
 
-                try:
                     movement_features = extract_features(lats, lons)
                     movement_label = classify(movement_features)
                     movement_activity_id = get_or_create_movement_activity(cur, movement_label)
@@ -388,8 +420,6 @@ async def ingest(payload: SensorPayload, request: Request):
                                               time_start=fixes[0][2], time_end=fixes[-1][2])
                     logger.info("MOVEMENT | dev_eui=%s features=%s label=%s",
                                 payload.dev_eui, movement_features, movement_label)
-                except ValueError as e:
-                    logger.info("MOVEMENT | dev_eui=%s skipped: %s", payload.dev_eui, e)
 
                 # 5. Finalize the previous reading's inertial activity slices now that
                 #    this reading's timestamp bounds its second half. (One-reading lag:

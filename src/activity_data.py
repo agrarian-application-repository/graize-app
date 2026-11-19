@@ -49,13 +49,13 @@ RUMINATING_LABEL = "ruminating"
 
 
 def get_connection():
-    return psycopg2.connect(
-        host=settings.db_host,
-        port=settings.db_port,
-        dbname=settings.db_name,
-        user=settings.db_user,
-        password=settings.db_password,
-    )
+    return psycopg2.connect(**{
+        "host": settings.db_host,
+        "port": settings.db_port,
+        "dbname": settings.db_name,
+        "user": settings.db_user,
+        "password": settings.db_password,
+    })
 
 
 def fetch_device_euis(conn) -> dict:

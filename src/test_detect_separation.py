@@ -70,7 +70,7 @@ def test_two_collars_alone_are_never_judged():
 def test_idle_collar_days_are_dropped_and_no_longer_flagged():
     fixes = simulate(days=2)
     idle = {(3, date(2026, 7, 23)), (3, date(2026, 7, 24))}
-    filtered = drop_idle_fixes(fixes, idle, utc_offset_hours=0)
+    filtered = drop_idle_fixes(fixes, idle, tz=0)
     assert filtered[3] == [] and len(filtered[1]) == len(fixes[1])
     _, bouts = run(filtered)
     assert all(b == [] for b in bouts.values())

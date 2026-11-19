@@ -49,12 +49,13 @@ import argparse
 import csv
 import os
 import sys
-from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from activity_data import (add_common_args, compute_daily_label_times, day_precheck,
-                           fetch_activities_by_device, fetch_device_euis, get_connection,
-                           mark_gaps, parse_excluded, per_24h, rounded)
+from activity_data import (DEFAULT_MAX_ROW_MINUTES, DEFAULT_MIN_COVERAGE_HOURS,
+                           DEFAULT_MIN_RUMINATION_HOURS, add_common_args,
+                           compute_daily_label_times, day_precheck, fetch_activities_by_device,
+                           fetch_device_euis, get_connection, local_date, mark_gaps,
+                           parse_excluded, per_24h, rounded)
 
 RESTING_LABEL = "laying_resting"
 
@@ -91,12 +92,12 @@ def find_resting_bouts(observed, bridge_s):
     return bouts
 
 
-def longest_bout_by_day(bouts, utc_offset_hours):
-    """Returns {local_date: bout} with the longest bout starting on each day."""
-    offset = timedelta(hours=utc_offset_hours)
+def longest_bout_by_day(bouts, tz):
+    """Returns {local_date: bout} with the longest bout starting on each day
+    (tz: tzinfo or hours from UTC)."""
     longest = {}
     for bout in bouts:
-        date = (bout["start"] + offset).date()
+        date = local_date(bout["start"], tz)
         if date not in longest or (bout["end"] - bout["start"]) > (
                 longest[date]["end"] - longest[date]["start"]):
             longest[date] = bout
@@ -117,6 +118,45 @@ def judge_day(totals, longest_bout_h, rest_threshold_h, bout_threshold_h,
     rest_flag = resting_24h > rest_threshold_h
     bout_flag = longest_bout_h > bout_threshold_h
     return ("anomaly" if rest_flag or bout_flag else "ok"), resting_24h, rest_flag, bout_flag
+
+
+def evaluate(activities_by_device, tz, rest_threshold_h=DEFAULT_REST_THRESHOLD_HOURS,
+             bout_threshold_h=DEFAULT_BOUT_THRESHOLD_HOURS, bridge_minutes=DEFAULT_BRIDGE_MINUTES,
+             min_coverage_h=DEFAULT_MIN_COVERAGE_HOURS,
+             min_rumination_h=DEFAULT_MIN_RUMINATION_HOURS,
+             max_row_minutes=DEFAULT_MAX_ROW_MINUTES, euis=None, excluded=()):
+    """Judges every collar-day. activities_by_device: output of
+    fetch_activities_by_device; tz: farm timezone (tzinfo or hours from UTC).
+    Returns one report row per collar-day; "date" is a datetime.date and
+    "bout_start"/"bout_end" are aware datetimes (or None)."""
+    euis = euis or {}
+    rows = []
+    for device_id in sorted(activities_by_device):
+        if device_id in excluded:
+            continue
+        observed = mark_gaps(activities_by_device[device_id], max_row_minutes * 60)
+        daily = compute_daily_label_times(observed, tz)
+        longest = longest_bout_by_day(find_resting_bouts(observed, bridge_minutes * 60), tz)
+        for date in sorted(daily):
+            bout = longest.get(date)
+            bout_h = (bout["end"] - bout["start"]).total_seconds() / 3600 if bout else 0.0
+            status, resting_24h, rest_flag, bout_flag = judge_day(
+                daily[date], bout_h, rest_threshold_h, bout_threshold_h,
+                min_coverage_h, min_rumination_h)
+            rows.append({
+                "device_id": device_id,
+                "eui": euis.get(device_id, ""),
+                "date": date,
+                "observed_hours": round(daily[date]["observed_s"] / 3600, 2),
+                "resting_hours_24h": rounded(resting_24h),
+                "longest_bout_hours": round(bout_h, 2),
+                "bout_start": bout["start"] if bout else None,
+                "bout_end": bout["end"] if bout else None,
+                "rest_flag": rest_flag,
+                "bout_flag": bout_flag,
+                "status": status,
+            })
+    return rows
 
 
 def fmt(value):
@@ -146,33 +186,14 @@ def main():
     by_device = fetch_activities_by_device(conn)
     conn.close()
 
-    report_rows = []
-    for device_id in sorted(by_device):
-        if device_id in excluded:
-            continue
-        observed = mark_gaps(by_device[device_id], args.max_row_minutes * 60)
-        daily = compute_daily_label_times(observed, args.utc_offset_hours)
-        longest = longest_bout_by_day(find_resting_bouts(observed, args.bridge_minutes * 60),
-                                      args.utc_offset_hours)
-        for date in sorted(daily):
-            bout = longest.get(date)
-            bout_h = (bout["end"] - bout["start"]).total_seconds() / 3600 if bout else 0.0
-            status, resting_24h, rest_flag, bout_flag = judge_day(
-                daily[date], bout_h, args.rest_threshold_hours, args.bout_threshold_hours,
-                args.min_coverage_hours, args.min_rumination_hours)
-            report_rows.append({
-                "device_id": device_id,
-                "eui": euis.get(device_id, ""),
-                "date": date.isoformat(),
-                "observed_hours": round(daily[date]["observed_s"] / 3600, 2),
-                "resting_hours_24h": rounded(resting_24h),
-                "longest_bout_hours": round(bout_h, 2),
-                "bout_start": bout["start"].isoformat() if bout else None,
-                "bout_end": bout["end"].isoformat() if bout else None,
-                "rest_flag": rest_flag,
-                "bout_flag": bout_flag,
-                "status": status,
-            })
+    report_rows = evaluate(by_device, args.utc_offset_hours, args.rest_threshold_hours,
+                           args.bout_threshold_hours, args.bridge_minutes,
+                           args.min_coverage_hours, args.min_rumination_hours,
+                           args.max_row_minutes, euis, excluded)
+    for r in report_rows:
+        r["date"] = r["date"].isoformat()
+        for key in ("bout_start", "bout_end"):
+            r[key] = r[key].isoformat() if r[key] else None
 
     print(f"{'device':<8}{'eui':<20}{'date':<12}{'obs_h':<8}{'rest24h':<9}{'bout_h':<8}"
           f"{'flags':<12}{'status':<14}")

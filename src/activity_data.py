@@ -33,7 +33,7 @@ GPS fixes are dropped by the separation detector (idle_collar_days).
 """
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 import psycopg2
 
@@ -105,24 +105,40 @@ def mark_gaps(activities, max_row_s):
     return out
 
 
-def split_by_day(time_start, time_end, utc_offset_hours=0.0):
-    """Split [time_start, time_end) (UTC) into per-local-calendar-day (date, seconds)
-    chunks, where "local" is UTC shifted by utc_offset_hours."""
-    offset = timedelta(hours=utc_offset_hours)
+def as_tz(tz):
+    """Accepts a tzinfo (e.g. ZoneInfo("Europe/Rome"), which follows summer/winter
+    time) or a fixed offset in hours from UTC, and returns a tzinfo."""
+    if isinstance(tz, (int, float)):
+        return timezone(timedelta(hours=tz))
+    return tz
+
+
+def local_date(ts, tz):
+    """Calendar date of an aware timestamp in tz (tzinfo or hours from UTC)."""
+    return ts.astimezone(as_tz(tz)).date()
+
+
+def local_midnight(date, tz):
+    """Aware datetime of 00:00 on `date` in tz (tzinfo or hours from UTC)."""
+    return datetime.combine(date, time.min, tzinfo=as_tz(tz))
+
+
+def split_by_day(time_start, time_end, tz=0.0):
+    """Split [time_start, time_end) (aware timestamps) into per-local-calendar-day
+    (date, seconds) chunks, where "local" is tz — a tzinfo or a fixed offset in
+    hours from UTC. With a real timezone, summer/winter time days are 23/25 h."""
+    tz = as_tz(tz)
     chunks = []
     cursor = time_start
     while cursor < time_end:
-        local_cursor = cursor + offset
-        next_local_midnight = datetime.combine(local_cursor.date(), datetime.min.time(),
-                                                 tzinfo=local_cursor.tzinfo) + timedelta(days=1)
-        next_midnight_utc = next_local_midnight - offset
-        chunk_end = min(time_end, next_midnight_utc)
-        chunks.append((local_cursor.date(), (chunk_end - cursor).total_seconds()))
+        day = local_date(cursor, tz)
+        chunk_end = min(time_end, local_midnight(day + timedelta(days=1), tz))
+        chunks.append((day, (chunk_end - cursor).total_seconds()))
         cursor = chunk_end
     return chunks
 
 
-def compute_daily_label_times(activities, utc_offset_hours=0.0) -> dict:
+def compute_daily_label_times(activities, tz=0.0) -> dict:
     """activities: output of mark_gaps() for one device.
     Returns {local_date: {"observed_s": float, <label>: float, ...}} with the
     observed (gap-free) time and the seconds carrying each behaviour label."""
@@ -130,7 +146,7 @@ def compute_daily_label_times(activities, utc_offset_hours=0.0) -> dict:
     for time_start, time_end, row_label in activities:
         if row_label is None:
             continue
-        for date, seconds in split_by_day(time_start, time_end, utc_offset_hours):
+        for date, seconds in split_by_day(time_start, time_end, tz):
             daily[date]["observed_s"] += seconds
             daily[date][row_label] += seconds
     return daily
@@ -152,7 +168,7 @@ def day_precheck(totals, min_coverage_h, min_rumination_h):
     return None
 
 
-def idle_collar_days(activities_by_device, max_row_s, utc_offset_hours, min_rumination_h,
+def idle_collar_days(activities_by_device, max_row_s, tz, min_rumination_h,
                      min_observed_h=1.0) -> set:
     """Returns {(device_id, local_date), ...} for collar-days with at least
     min_observed_h of observed behaviour but less than min_rumination_h of
@@ -160,7 +176,7 @@ def idle_collar_days(activities_by_device, max_row_s, utc_offset_hours, min_rumi
     behaviour data aren't included (unknown, not idle)."""
     idle = set()
     for device_id, activities in activities_by_device.items():
-        daily = compute_daily_label_times(mark_gaps(activities, max_row_s), utc_offset_hours)
+        daily = compute_daily_label_times(mark_gaps(activities, max_row_s), tz)
         for date, totals in daily.items():
             if (totals["observed_s"] >= min_observed_h * 3600
                     and per_24h(totals, RUMINATING_LABEL) < min_rumination_h):

@@ -23,7 +23,7 @@ Livestock collars transmit periodic sensor data over LoRaWAN to a local Raspberr
 
 | Variable | Description | Default |
 |---|---|---|
-| `DB_HOST` | PostgreSQL host | `10.160.101.177` |
+| `DB_HOST` | PostgreSQL host | `10.160.101.65` |
 | `DB_PORT` | PostgreSQL port | `5432` |
 | `DB_NAME` | Database name | `graize_db` |
 | `DB_USER` | Database user | *(required)* |

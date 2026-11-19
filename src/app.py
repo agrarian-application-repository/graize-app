@@ -22,11 +22,16 @@ from classify_movement import extract_features, classify, LAT_LON_SCALE
 class Settings(BaseSettings):
     model_config = {"env_file": ".env"}
 
-    db_host: str = "10.160.101.177"
+    db_host: str = "10.160.101.65"
     db_port: int = 5432
     db_name: str = "graize_db"
     db_user: str | None = None
     db_password: str | None = None
+
+    # Periodic anomaly detection (see anomaly_scheduler.py)
+    anomaly_scheduler_enabled: bool = True
+    farm_timezone: str = "Europe/Rome"
+    anomaly_run_hours: str = "0,6,12,18"
 
 settings = Settings()
 
@@ -45,6 +50,18 @@ logger = logging.getLogger("graize-app")
 # ---------------------------------------------------------------------------
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def start_anomaly_scheduler():
+    """Starts the background thread that runs the anomaly detectors on a
+    schedule. Imported here, not at module top, because the detectors import
+    `settings` from this module."""
+    if not settings.anomaly_scheduler_enabled:
+        logger.info("Anomaly scheduler disabled (ANOMALY_SCHEDULER_ENABLED=false)")
+        return
+    from anomaly_scheduler import parse_run_hours, start_scheduler
+    start_scheduler(settings.farm_timezone, parse_run_hours(settings.anomaly_run_hours))
 
 # ---------------------------------------------------------------------------
 # Classification (feature_1 / feature_2 → animal behaviour prediction)
@@ -465,4 +482,7 @@ async def ingest(payload: SensorPayload, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=80)
+    # Served by import string so the running app is the `app` module itself —
+    # the same one the anomaly detectors import `settings` from — rather than
+    # this `__main__` copy.
+    uvicorn.run("app:app", host="0.0.0.0", port=80)

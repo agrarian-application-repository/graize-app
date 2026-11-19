@@ -38,9 +38,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from activity_data import (RUMINATING_LABEL, add_common_args, compute_daily_label_times,
-                           day_precheck, fetch_activities_by_device, fetch_device_euis,
-                           get_connection, mark_gaps, parse_excluded, per_24h, rounded)
+from activity_data import (DEFAULT_MAX_ROW_MINUTES, DEFAULT_MIN_COVERAGE_HOURS,
+                           DEFAULT_MIN_RUMINATION_HOURS, RUMINATING_LABEL, add_common_args,
+                           compute_daily_label_times, day_precheck, fetch_activities_by_device,
+                           fetch_device_euis, get_connection, mark_gaps, parse_excluded,
+                           per_24h, rounded)
 
 FORAGING_LABEL = "foraging"
 
@@ -64,6 +66,37 @@ def judge_day(totals, threshold_h, min_coverage_h, min_rumination_h):
     return status, foraging_24h, ruminating_24h
 
 
+def evaluate(activities_by_device, tz, threshold_h=DEFAULT_THRESHOLD_HOURS,
+             min_coverage_h=DEFAULT_MIN_COVERAGE_HOURS,
+             min_rumination_h=DEFAULT_MIN_RUMINATION_HOURS,
+             max_row_minutes=DEFAULT_MAX_ROW_MINUTES, euis=None, excluded=()):
+    """Judges every collar-day. activities_by_device: output of
+    fetch_activities_by_device; tz: farm timezone (tzinfo or hours from UTC).
+    Returns one report row per collar-day; "date" is a datetime.date."""
+    euis = euis or {}
+    rows = []
+    for device_id in sorted(activities_by_device):
+        if device_id in excluded:
+            continue
+        observed = mark_gaps(activities_by_device[device_id], max_row_minutes * 60)
+        daily = compute_daily_label_times(observed, tz)
+        for date in sorted(daily):
+            totals = daily[date]
+            status, foraging_24h, ruminating_24h = judge_day(
+                totals, threshold_h, min_coverage_h, min_rumination_h)
+            rows.append({
+                "device_id": device_id,
+                "eui": euis.get(device_id, ""),
+                "date": date,
+                "observed_hours": round(totals["observed_s"] / 3600, 2),
+                "foraging_hours": round(totals.get(FORAGING_LABEL, 0.0) / 3600, 2),
+                "foraging_hours_24h": rounded(foraging_24h),
+                "ruminating_hours_24h": rounded(ruminating_24h),
+                "status": status,
+            })
+    return rows
+
+
 def fmt(value):
     return "-" if value is None else value
 
@@ -85,26 +118,11 @@ def main():
     by_device = fetch_activities_by_device(conn)
     conn.close()
 
-    report_rows = []
-    for device_id in sorted(by_device):
-        if device_id in excluded:
-            continue
-        observed = mark_gaps(by_device[device_id], args.max_row_minutes * 60)
-        daily = compute_daily_label_times(observed, args.utc_offset_hours)
-        for date in sorted(daily):
-            totals = daily[date]
-            status, foraging_24h, ruminating_24h = judge_day(
-                totals, args.threshold_hours, args.min_coverage_hours, args.min_rumination_hours)
-            report_rows.append({
-                "device_id": device_id,
-                "eui": euis.get(device_id, ""),
-                "date": date.isoformat(),
-                "observed_hours": round(totals["observed_s"] / 3600, 2),
-                "foraging_hours": round(totals.get(FORAGING_LABEL, 0.0) / 3600, 2),
-                "foraging_hours_24h": rounded(foraging_24h),
-                "ruminating_hours_24h": rounded(ruminating_24h),
-                "status": status,
-            })
+    report_rows = evaluate(by_device, args.utc_offset_hours, args.threshold_hours,
+                           args.min_coverage_hours, args.min_rumination_hours,
+                           args.max_row_minutes, euis, excluded)
+    for r in report_rows:
+        r["date"] = r["date"].isoformat()
 
     print(f"{'device':<8}{'eui':<20}{'date':<12}{'obs_h':<8}{'forage24h':<11}{'rumin24h':<10}{'status':<14}")
     for r in report_rows:

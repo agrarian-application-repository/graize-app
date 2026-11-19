@@ -74,7 +74,7 @@ from statistics import median
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from activity_data import (DEFAULT_MAX_ROW_MINUTES, DEFAULT_MIN_RUMINATION_HOURS,
                            fetch_activities_by_device, fetch_device_euis, get_connection,
-                           idle_collar_days, parse_excluded)
+                           idle_collar_days, local_date, parse_excluded)
 from app import is_valid_coordinate, LAT_SCALED_BOUND, LON_SCALED_BOUND
 from classify_movement import haversine, LAT_LON_SCALE
 
@@ -109,10 +109,10 @@ def fetch_valid_fixes_by_device(conn) -> dict:
     return by_device
 
 
-def drop_idle_fixes(by_device, idle_days, utc_offset_hours):
-    """Removes fixes that fall on an idle collar-day {(device_id, local_date)}."""
-    offset = timedelta(hours=utc_offset_hours)
-    return {d: [f for f in fixes if (d, (f[0] + offset).date()) not in idle_days]
+def drop_idle_fixes(by_device, idle_days, tz):
+    """Removes fixes that fall on an idle collar-day {(device_id, local_date)}
+    (tz: tzinfo or hours from UTC, the same one the idle days were built with)."""
+    return {d: [f for f in fixes if (d, local_date(f[0], tz)) not in idle_days]
             for d, fixes in by_device.items()}
 
 
@@ -221,6 +221,26 @@ def detect(by_device, tolerance, min_herd_size, threshold_m, min_duration_minute
     return readings_by_device, bouts_by_device
 
 
+def evaluate(fixes_by_device, activities_by_device, tz,
+             threshold_m=DEFAULT_DISTANCE_THRESHOLD_M,
+             tolerance=timedelta(minutes=DEFAULT_TIME_TOLERANCE_MINUTES),
+             min_herd_size=DEFAULT_MIN_HERD_SIZE,
+             min_duration_minutes=DEFAULT_MIN_DURATION_MINUTES,
+             min_rumination_h=DEFAULT_MIN_RUMINATION_HOURS, excluded=()):
+    """Full pipeline from DB data: drops excluded devices and idle collar-days,
+    then runs detect(). fixes_by_device: output of fetch_valid_fixes_by_device;
+    activities_by_device: output of fetch_activities_by_device (for the
+    idle-collar check); tz: farm timezone (tzinfo or hours from UTC).
+    Returns (fixes, kept_fixes, readings_by_device, bouts_by_device)."""
+    fixes = {d: f for d, f in fixes_by_device.items() if d not in excluded}
+    idle_days = idle_collar_days(activities_by_device, DEFAULT_MAX_ROW_MINUTES * 60, tz,
+                                 min_rumination_h)
+    kept = drop_idle_fixes(fixes, idle_days, tz)
+    readings_by_device, bouts_by_device = detect(kept, tolerance, min_herd_size, threshold_m,
+                                                 min_duration_minutes)
+    return fixes, kept, readings_by_device, bouts_by_device
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Flag an animal staying far from every other animal while the rest of "
@@ -253,15 +273,13 @@ def main():
 
     conn = get_connection()
     euis = fetch_device_euis(conn)
-    fixes = {d: f for d, f in fetch_valid_fixes_by_device(conn).items() if d not in excluded}
-    idle_days = idle_collar_days(fetch_activities_by_device(conn), DEFAULT_MAX_ROW_MINUTES * 60,
-                                 args.utc_offset_hours, args.min_rumination_hours)
+    all_fixes = fetch_valid_fixes_by_device(conn)
+    activities = fetch_activities_by_device(conn)
     conn.close()
 
-    by_device = drop_idle_fixes(fixes, idle_days, args.utc_offset_hours)
-    readings_by_device, bouts_by_device = detect(
-        by_device, tolerance, args.min_herd_size, args.distance_threshold_m,
-        args.min_duration_minutes)
+    fixes, by_device, readings_by_device, bouts_by_device = evaluate(
+        all_fixes, activities, args.utc_offset_hours, args.distance_threshold_m, tolerance,
+        args.min_herd_size, args.min_duration_minutes, args.min_rumination_hours, excluded)
 
     report_rows = []
     for device_id in sorted(bouts_by_device):

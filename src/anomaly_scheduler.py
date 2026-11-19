@@ -35,6 +35,7 @@ default thresholds.
 import logging
 import threading
 from datetime import datetime, time, timedelta, timezone
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import detect_feeding_anomalies as feeding
@@ -117,7 +118,9 @@ def store_anomalies(conn, found):
 
 def run_once(tz):
     """One full detection run. Returns the number of new anomalies stored,
-    or None if another instance held the lock. Raises on DB/detector errors."""
+    or None if another instance held the lock. Raises on DB/detector errors.
+    Logs how long the run took (DB read + detection + storing)."""
+    started = monotonic()
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -131,7 +134,8 @@ def run_once(tz):
             found = find_anomalies(activities, fixes, tz)
             inserted = store_anomalies(conn, found)
             conn.commit()
-            logger.info("Anomaly run done: %d finding(s), %d new stored", len(found), inserted)
+            logger.info("Anomaly run done in %.1f s: %d finding(s), %d new stored",
+                        monotonic() - started, len(found), inserted)
             return inserted
         finally:
             conn.rollback()   # no-op after commit; clears a failed transaction before unlocking
